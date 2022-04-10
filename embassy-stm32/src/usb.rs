@@ -16,6 +16,8 @@ use futures::Future;
 
 use crate::gpio::low_level::AFType;
 use crate::interrupt::Interrupt;
+use crate::pac;
+use crate::pac::usb::{regs, vals};
 use crate::rcc::low_level::RccPeripheral;
 
 const NEW_AW: AtomicWaker = AtomicWaker::new();
@@ -24,6 +26,7 @@ static EP0_WAKER: AtomicWaker = NEW_AW;
 static EP_IN_WAKERS: [AtomicWaker; 8] = [NEW_AW; 8];
 static EP_OUT_WAKERS: [AtomicWaker; 8] = [NEW_AW; 8];
 static READY_ENDPOINTS: AtomicU32 = AtomicU32::new(0);
+static IRQ_FLAGS: AtomicU32 = AtomicU32::new(0);
 
 pub struct Driver<'d, T: Instance> {
     phantom: PhantomData<&'d mut T>,
@@ -60,6 +63,25 @@ impl<'d, T: Instance> Driver<'d, T> {
             let regs = T::regs();
             let x = regs.istr().read().0;
             info!("USB IRQ: {:08x}", x);
+
+            // mask of all the enabled irqs
+            let mut mask = regs::Istr(0);
+            mask.set_wkup(true);
+            mask.set_susp(true);
+            mask.set_reset(true);
+
+            let istr = regs.istr().read();
+
+            let flags = istr.0 & mask.0;
+            if flags != 0 {
+                // Ideally we'd disable (mask) the irq and then let main thread check the bit
+                // in ISTR, but it's not possible to atomically mask IRQs in CNTR.
+                // Instead, send the flags to main thread through an atomic ourselves.
+                IRQ_FLAGS.fetch_or(flags, Ordering::AcqRel);
+
+                // Write 0 to clear.
+                regs.istr().write_value(regs::Istr(!flags));
+            }
         }
     }
 
@@ -137,10 +159,19 @@ impl<'d, T: Instance> driver::Driver<'d> for Driver<'d, T> {
             let regs = T::regs();
 
             unsafe {
+                crate::peripherals::PWR::enable();
+
+                pac::PWR
+                    .cr2()
+                    .modify(|w| w.set_usv(pac::pwr::vals::Usv::VALID));
+
                 <T as RccPeripheral>::enable();
                 <T as RccPeripheral>::reset();
 
-                regs.cntr().write(|w| w.set_pdwn(true));
+                regs.cntr().write(|w| {
+                    w.set_pdwn(true);
+                    w.set_fres(true);
+                });
 
                 Timer::after(Duration::from_millis(100)).await;
 
@@ -179,10 +210,33 @@ impl<'d, T: Instance> driver::Bus for Bus<'d, T> {
     type PollFuture<'a> = impl Future<Output = Event> + 'a where Self: 'a;
 
     fn poll<'a>(&'a mut self) -> Self::PollFuture<'a> {
-        poll_fn(|cx| {
+        poll_fn(|cx| unsafe {
             BUS_WAKER.register(cx.waker());
             let regs = T::regs();
-            // TODO
+
+            let istr = regs::Istr(IRQ_FLAGS.load(Ordering::Acquire));
+
+            if istr.wkup() {
+                let mut mask = regs::Istr(!0);
+                mask.set_wkup(false);
+                IRQ_FLAGS.fetch_and(mask.0, Ordering::AcqRel);
+
+                // Required by datasheet
+                regs.cntr().modify(|w| w.set_fsusp(false));
+                return Poll::Ready(Event::Resume);
+            }
+            if istr.reset() {
+                let mut mask = regs::Istr(!0);
+                mask.set_reset(false);
+                IRQ_FLAGS.fetch_and(mask.0, Ordering::AcqRel);
+                return Poll::Ready(Event::Reset);
+            }
+            if istr.susp() {
+                let mut mask = regs::Istr(!0);
+                mask.set_susp(false);
+                IRQ_FLAGS.fetch_and(mask.0, Ordering::AcqRel);
+                return Poll::Ready(Event::Suspend);
+            }
 
             Poll::Pending
         })
@@ -191,6 +245,21 @@ impl<'d, T: Instance> driver::Bus for Bus<'d, T> {
     #[inline]
     fn reset(&mut self) {
         self.set_configured(false);
+        let regs = T::regs();
+
+        unsafe {
+            trace!("RESET REGS WRITINGINGING");
+            regs.daddr().write(|w| {
+                w.set_ef(true);
+                w.set_add(0);
+            });
+
+            regs.epr(0).write(|w| {
+                w.set_ep_type(vals::EpType::CONTROL);
+                w.set_stat_rx(vals::StatRx::VALID);
+                w.set_stat_tx(vals::StatTx::NAK);
+            });
+        }
     }
 
     #[inline]

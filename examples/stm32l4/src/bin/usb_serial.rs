@@ -34,6 +34,7 @@ fn config() -> Config {
         PLLMul::Mul8,
         Some(PLLClkDiv::Div2),
     );
+    config.rcc.hsi48 = true;
 
     config
 }
