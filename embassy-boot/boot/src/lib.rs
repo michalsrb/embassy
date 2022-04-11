@@ -14,7 +14,7 @@
 ///!
 mod fmt;
 
-use embedded_storage::nor_flash::{NorFlash, ReadNorFlash};
+use embedded_storage::nor_flash::{NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash};
 use embedded_storage_async::nor_flash::AsyncNorFlash;
 
 pub const BOOT_MAGIC: u32 = 0xD00DF00D;
@@ -45,15 +45,32 @@ pub enum State {
 
 #[derive(PartialEq, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub enum BootError<E> {
-    Flash(E),
+pub enum BootError {
+    Flash(NorFlashErrorKind),
     BadMagic,
 }
 
-impl<E> From<E> for BootError<E> {
+impl<E> From<E> for BootError
+where
+    E: NorFlashError,
+{
     fn from(error: E) -> Self {
-        BootError::Flash(error)
+        BootError::Flash(error.kind())
     }
+}
+
+/// Trait defining the flash handles used for active and DFU partition
+pub trait FlashProvider {
+    type STATE: NorFlash + ReadNorFlash;
+    type ACTIVE: NorFlash + ReadNorFlash;
+    type DFU: NorFlash + ReadNorFlash;
+
+    /// Return flash instance used to write/read to/from active partition.
+    fn active(&mut self) -> &mut Self::ACTIVE;
+    /// Return flash instance used to write/read to/from dfu partition.
+    fn dfu(&mut self) -> &mut Self::DFU;
+    /// Return flash instance used to write/read to/from bootloader state.
+    fn state(&mut self) -> &mut Self::STATE;
 }
 
 /// BootLoader works with any flash implementing embedded_storage and can also work with
@@ -168,19 +185,16 @@ impl<const PAGE_SIZE: usize> BootLoader<PAGE_SIZE> {
     /// |       DFU |            3 |      3 |      2 |      1 |      3 |
     /// +-----------+--------------+--------+--------+--------+--------+
     ///
-    pub fn prepare_boot<F: NorFlash + ReadNorFlash>(
-        &mut self,
-        flash: &mut F,
-    ) -> Result<State, BootError<F::Error>> {
+    pub fn prepare_boot<F: FlashProvider>(&mut self, flash: &mut F) -> Result<State, BootError> {
         // Copy contents from partition N to active
-        let state = self.read_state(flash)?;
+        let state = self.read_state(flash.state())?;
         match state {
             State::Swap => {
                 //
                 // Check if we already swapped. If we're in the swap state, this means we should revert
                 // since the app has failed to mark boot as successful
                 //
-                if !self.is_swapped(flash)? {
+                if !self.is_swapped(flash.state())? {
                     trace!("Swapping");
                     self.swap(flash)?;
                 } else {
@@ -188,9 +202,10 @@ impl<const PAGE_SIZE: usize> BootLoader<PAGE_SIZE> {
                     self.revert(flash)?;
 
                     // Overwrite magic and reset progress
-                    flash.write(self.state.from as u32, &[0, 0, 0, 0])?;
-                    flash.erase(self.state.from as u32, self.state.to as u32)?;
-                    flash.write(self.state.from as u32, &BOOT_MAGIC.to_le_bytes())?;
+                    let fstate = flash.state();
+                    fstate.write(self.state.from as u32, &[0, 0, 0, 0])?;
+                    fstate.erase(self.state.from as u32, self.state.to as u32)?;
+                    fstate.write(self.state.from as u32, &BOOT_MAGIC.to_le_bytes())?;
                 }
             }
             _ => {}
@@ -231,24 +246,41 @@ impl<const PAGE_SIZE: usize> BootLoader<PAGE_SIZE> {
         self.dfu.from + n * PAGE_SIZE
     }
 
-    fn copy_page_once<F: NorFlash + ReadNorFlash>(
+    fn copy_page_once_from_active<F: FlashProvider>(
         &mut self,
         idx: usize,
         from: usize,
         to: usize,
         flash: &mut F,
-    ) -> Result<(), F::Error> {
+    ) -> Result<(), BootError> {
         let mut buf: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
-        if self.current_progress(flash)? <= idx {
-            flash.read(from as u32, &mut buf)?;
-            flash.erase(to as u32, (to + PAGE_SIZE) as u32)?;
-            flash.write(to as u32, &buf)?;
-            self.update_progress(idx, flash)?;
+        if self.current_progress(flash.state())? <= idx {
+            flash.active().read(from as u32, &mut buf)?;
+            flash.dfu().erase(to as u32, (to + PAGE_SIZE) as u32)?;
+            flash.dfu().write(to as u32, &buf)?;
+            self.update_progress(idx, flash.state())?;
         }
         Ok(())
     }
 
-    fn swap<F: NorFlash + ReadNorFlash>(&mut self, flash: &mut F) -> Result<(), F::Error> {
+    fn copy_page_once_from_dfu<F: FlashProvider>(
+        &mut self,
+        idx: usize,
+        from: usize,
+        to: usize,
+        flash: &mut F,
+    ) -> Result<(), BootError> {
+        let mut buf: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+        if self.current_progress(flash.state())? <= idx {
+            flash.dfu().read(from as u32, &mut buf)?;
+            flash.active().erase(to as u32, (to + PAGE_SIZE) as u32)?;
+            flash.active().write(to as u32, &buf)?;
+            self.update_progress(idx, flash.state())?;
+        }
+        Ok(())
+    }
+
+    fn swap<F: FlashProvider>(&mut self, flash: &mut F) -> Result<(), BootError> {
         let page_count = self.active.len() / PAGE_SIZE;
         // trace!("Page count: {}", page_count);
         for page in 0..page_count {
@@ -256,36 +288,46 @@ impl<const PAGE_SIZE: usize> BootLoader<PAGE_SIZE> {
             let active_page = self.active_addr(page_count - 1 - page);
             let dfu_page = self.dfu_addr(page_count - page);
             // info!("Copy active {} to dfu {}", active_page, dfu_page);
-            self.copy_page_once(page * 2, active_page, dfu_page, flash)?;
+            self.copy_page_once_from_active(page * 2, active_page, dfu_page, flash)?;
 
             // Copy DFU page to the active page
             let active_page = self.active_addr(page_count - 1 - page);
             let dfu_page = self.dfu_addr(page_count - 1 - page);
             //info!("Copy dfy {} to active {}", dfu_page, active_page);
-            self.copy_page_once(page * 2 + 1, dfu_page, active_page, flash)?;
+            self.copy_page_once_from_dfu(page * 2 + 1, dfu_page, active_page, flash)?;
         }
 
         Ok(())
     }
 
-    fn revert<F: NorFlash + ReadNorFlash>(&mut self, flash: &mut F) -> Result<(), F::Error> {
+    fn revert<F: FlashProvider>(&mut self, flash: &mut F) -> Result<(), BootError> {
         let page_count = self.active.len() / PAGE_SIZE;
         for page in 0..page_count {
             // Copy the bad active page to the DFU page
             let active_page = self.active_addr(page);
             let dfu_page = self.dfu_addr(page);
-            self.copy_page_once(page_count * 2 + page * 2, active_page, dfu_page, flash)?;
+            self.copy_page_once_from_active(
+                page_count * 2 + page * 2,
+                active_page,
+                dfu_page,
+                flash,
+            )?;
 
             // Copy the DFU page back to the active page
             let active_page = self.active_addr(page);
             let dfu_page = self.dfu_addr(page + 1);
-            self.copy_page_once(page_count * 2 + page * 2 + 1, dfu_page, active_page, flash)?;
+            self.copy_page_once_from_dfu(
+                page_count * 2 + page * 2 + 1,
+                dfu_page,
+                active_page,
+                flash,
+            )?;
         }
 
         Ok(())
     }
 
-    fn read_state<F: ReadNorFlash>(&mut self, flash: &mut F) -> Result<State, BootError<F::Error>> {
+    fn read_state<F: ReadNorFlash>(&mut self, flash: &mut F) -> Result<State, BootError> {
         let mut magic: [u8; 4] = [0; 4];
         flash.read(self.state.from as u32, &mut magic)?;
 
@@ -293,6 +335,42 @@ impl<const PAGE_SIZE: usize> BootLoader<PAGE_SIZE> {
             SWAP_MAGIC => Ok(State::Swap),
             _ => Ok(State::Boot),
         }
+    }
+}
+
+/// Convenience provider that uses a single flash for everything
+pub struct SingleFlashProvider<'a, F>
+where
+    F: NorFlash + ReadNorFlash,
+{
+    flash: &'a mut F,
+}
+
+impl<'a, F> SingleFlashProvider<'a, F>
+where
+    F: NorFlash + ReadNorFlash,
+{
+    pub fn new(flash: &'a mut F) -> Self {
+        Self { flash }
+    }
+}
+
+impl<'a, F> FlashProvider for SingleFlashProvider<'a, F>
+where
+    F: NorFlash + ReadNorFlash,
+{
+    type STATE = F;
+    type ACTIVE = F;
+    type DFU = F;
+
+    fn active(&mut self) -> &mut F {
+        self.flash
+    }
+    fn dfu(&mut self) -> &mut F {
+        self.flash
+    }
+    fn state(&mut self) -> &mut F {
+        self.flash
     }
 }
 
