@@ -9,10 +9,11 @@ use embassy::util::Unborrow;
 use embassy::waitqueue::AtomicWaker;
 use embassy_hal_common::unborrow;
 use embassy_usb::control::Request;
-use embassy_usb::driver::{self, EndpointError, Event};
+use embassy_usb::driver::{self, EndpointAllocError, EndpointError, Event};
 use embassy_usb::types::{EndpointAddress, EndpointInfo, EndpointType, UsbDirection};
 use futures::future::poll_fn;
 use futures::Future;
+use heapless::Vec;
 
 use crate::gpio::low_level::AFType;
 use crate::interrupt::Interrupt;
@@ -28,10 +29,18 @@ static EP_OUT_WAKERS: [AtomicWaker; 8] = [NEW_AW; 8];
 static READY_ENDPOINTS: AtomicU32 = AtomicU32::new(0);
 static IRQ_FLAGS: AtomicU32 = AtomicU32::new(0);
 
+#[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+struct EndpointData {
+    ep_addr: u8,
+    ep_type: EndpointType,
+    used_in: bool,
+    used_out: bool,
+}
+
 pub struct Driver<'d, T: Instance> {
     phantom: PhantomData<&'d mut T>,
-    alloc_in: Allocator,
-    alloc_out: Allocator,
+    alloc: Vec<EndpointData, 8>,
 }
 
 impl<'d, T: Instance> Driver<'d, T> {
@@ -53,8 +62,7 @@ impl<'d, T: Instance> Driver<'d, T> {
 
         Self {
             phantom: PhantomData,
-            alloc_in: Allocator::new(),
-            alloc_out: Allocator::new(),
+            alloc: Vec::new(),
         }
     }
 
@@ -82,6 +90,28 @@ impl<'d, T: Instance> Driver<'d, T> {
                 // Write 0 to clear.
                 regs.istr().write_value(regs::Istr(!flags));
             }
+
+            if istr.ctr() {
+                let index = istr.ep_id() as usize;
+                let mut epr = regs.epr(index).read();
+                let mut ready_mask: u32 = 0;
+                if epr.ctr_rx() {
+                    info!("EP {} RX, setup={}", index, epr.setup());
+                    ready_mask |= Out::mask(index);
+                }
+                if epr.ctr_tx() {
+                    info!("EP {} TX", index);
+                    ready_mask |= In::mask(index);
+                }
+                READY_ENDPOINTS.fetch_or(ready_mask, Ordering::AcqRel);
+                epr.set_dtog_rx(false);
+                epr.set_dtog_tx(false);
+                epr.set_stat_rx(vals::StatRx(0));
+                epr.set_stat_tx(vals::StatTx(0));
+                epr.set_ctr_rx(!epr.ctr_rx());
+                epr.set_ctr_tx(!epr.ctr_tx());
+                regs.epr(index).write_value(epr);
+            }
         }
     }
 
@@ -94,6 +124,92 @@ impl<'d, T: Instance> Driver<'d, T> {
         let regs = T::regs();
         // TODO
         false
+    }
+
+    fn unused_addr(&self) -> Result<u8, EndpointAllocError> {
+        for addr in 1..16 {
+            if self.alloc.iter().find(|ep| ep.ep_addr == addr).is_none() {
+                return Ok(addr);
+            }
+        }
+        Err(EndpointAllocError)
+    }
+
+    fn alloc_endpoint<Dir>(
+        &mut self,
+        ep_addr: Option<EndpointAddress>,
+        ep_type: EndpointType,
+        max_packet_size: u16,
+        interval: u8,
+        is_out: bool,
+    ) -> Result<Endpoint<'d, T, Dir>, driver::EndpointAllocError> {
+        trace!(
+            "allocating addr={:?} type={:?} mps={:?} interval={}, out={}",
+            ep_addr,
+            ep_type,
+            max_packet_size,
+            interval,
+            is_out
+        );
+
+        let index = self.alloc.iter_mut().enumerate().find(|(_, ep)| {
+            if let Some(ep_addr) = ep_addr {
+                // If the user requests a particular addr, check if we already have an EP with that one.
+                // If there is, we MUST use that one, it's not allowed to have multiple EPRs with the same addr
+                // TODO: is it? the docs say it is for double-buffered.
+                ep.ep_addr == ep_addr.index() as _
+            } else {
+                // Find one EP with the right kind, and where the right half is not used.
+                let used = if is_out { ep.used_out } else { ep.used_in };
+                ep.ep_type == ep_type && !used
+            }
+        });
+
+        let index = match index {
+            Some((index, _)) => index,
+            None => {
+                let ep = EndpointData {
+                    ep_addr: match ep_addr {
+                        Some(ep_addr) => ep_addr.index() as _,
+                        None => self.unused_addr()?,
+                    },
+                    ep_type,
+                    used_in: false,
+                    used_out: false,
+                };
+
+                let index = self.alloc.len();
+                self.alloc.push(ep).map_err(|_| EndpointAllocError)?;
+                index
+            }
+        };
+
+        let ep = &mut self.alloc[index];
+        trace!("  index={} ep={:?}", index, ep);
+        assert!(ep.ep_type == ep_type);
+        if let Some(ep_addr) = ep_addr {
+            assert!(ep.ep_addr == ep_addr.index() as _);
+        }
+
+        if is_out {
+            assert!(!ep.used_out);
+            ep.used_out = true;
+        } else {
+            assert!(!ep.used_in);
+            ep.used_in = true;
+        }
+
+        let ep_addr = EndpointAddress::from_parts(index, UsbDirection::In);
+        Ok(Endpoint {
+            _phantom: PhantomData,
+            index: index as _,
+            info: EndpointInfo {
+                addr: ep_addr,
+                ep_type,
+                max_packet_size,
+                interval,
+            },
+        })
     }
 }
 
@@ -111,16 +227,7 @@ impl<'d, T: Instance> driver::Driver<'d> for Driver<'d, T> {
         max_packet_size: u16,
         interval: u8,
     ) -> Result<Self::EndpointIn, driver::EndpointAllocError> {
-        let index = self
-            .alloc_in
-            .allocate(ep_addr, ep_type, max_packet_size, interval)?;
-        let ep_addr = EndpointAddress::from_parts(index, UsbDirection::In);
-        Ok(Endpoint::new(EndpointInfo {
-            addr: ep_addr,
-            ep_type,
-            max_packet_size,
-            interval,
-        }))
+        self.alloc_endpoint(ep_addr, ep_type, max_packet_size, interval, false)
     }
 
     fn alloc_endpoint_out(
@@ -130,16 +237,7 @@ impl<'d, T: Instance> driver::Driver<'d> for Driver<'d, T> {
         max_packet_size: u16,
         interval: u8,
     ) -> Result<Self::EndpointOut, driver::EndpointAllocError> {
-        let index = self
-            .alloc_out
-            .allocate(ep_addr, ep_type, max_packet_size, interval)?;
-        let ep_addr = EndpointAddress::from_parts(index, UsbDirection::Out);
-        Ok(Endpoint::new(EndpointInfo {
-            addr: ep_addr,
-            ep_type,
-            max_packet_size,
-            interval,
-        }))
+        self.alloc_endpoint(ep_addr, ep_type, max_packet_size, interval, true)
     }
 
     fn alloc_control_pipe(
@@ -193,8 +291,6 @@ impl<'d, T: Instance> driver::Driver<'d> for Driver<'d, T> {
 
             Bus {
                 phantom: PhantomData,
-                alloc_in: self.alloc_in,
-                alloc_out: self.alloc_out,
             }
         }
     }
@@ -202,8 +298,6 @@ impl<'d, T: Instance> driver::Driver<'d> for Driver<'d, T> {
 
 pub struct Bus<'d, T: Instance> {
     phantom: PhantomData<&'d mut T>,
-    alloc_in: Allocator,
-    alloc_out: Allocator,
 }
 
 impl<'d, T: Instance> driver::Bus for Bus<'d, T> {
@@ -305,12 +399,18 @@ pub enum In {}
 
 trait EndpointDir {
     fn waker(i: usize) -> &'static AtomicWaker;
+    fn mask(i: usize) -> u32;
 }
 
 impl EndpointDir for In {
     #[inline]
     fn waker(i: usize) -> &'static AtomicWaker {
         &EP_IN_WAKERS[i - 1]
+    }
+
+    #[inline]
+    fn mask(i: usize) -> u32 {
+        1 << i
     }
 }
 
@@ -319,20 +419,17 @@ impl EndpointDir for Out {
     fn waker(i: usize) -> &'static AtomicWaker {
         &EP_OUT_WAKERS[i - 1]
     }
+
+    #[inline]
+    fn mask(i: usize) -> u32 {
+        1 << (i + 16)
+    }
 }
 
 pub struct Endpoint<'d, T: Instance, Dir> {
     _phantom: PhantomData<(&'d mut T, Dir)>,
     info: EndpointInfo,
-}
-
-impl<'d, T: Instance, Dir> Endpoint<'d, T, Dir> {
-    fn new(info: EndpointInfo) -> Self {
-        Self {
-            info,
-            _phantom: PhantomData,
-        }
-    }
+    index: u8,
 }
 
 impl<'d, T: Instance, Dir: EndpointDir> driver::Endpoint for Endpoint<'d, T, Dir> {
@@ -447,75 +544,6 @@ fn dma_start() {
 
 fn dma_end() {
     compiler_fence(Ordering::Acquire);
-}
-
-struct Allocator {
-    used: u16,
-    // Buffers can be up to 64 Bytes since this is a Full-Speed implementation.
-    lens: [u8; 9],
-}
-
-impl Allocator {
-    fn new() -> Self {
-        Self {
-            used: 0,
-            lens: [0; 9],
-        }
-    }
-
-    fn allocate(
-        &mut self,
-        ep_addr: Option<EndpointAddress>,
-        ep_type: EndpointType,
-        max_packet_size: u16,
-        _interval: u8,
-    ) -> Result<usize, driver::EndpointAllocError> {
-        // Endpoint addresses are fixed in hardware:
-        // - 0x80 / 0x00 - Control        EP0
-        // - 0x81 / 0x01 - Bulk/Interrupt EP1
-        // - 0x82 / 0x02 - Bulk/Interrupt EP2
-        // - 0x83 / 0x03 - Bulk/Interrupt EP3
-        // - 0x84 / 0x04 - Bulk/Interrupt EP4
-        // - 0x85 / 0x05 - Bulk/Interrupt EP5
-        // - 0x86 / 0x06 - Bulk/Interrupt EP6
-        // - 0x87 / 0x07 - Bulk/Interrupt EP7
-        // - 0x88 / 0x08 - Isochronous
-
-        // Endpoint directions are allocated individually.
-
-        let alloc_index = if let Some(ep_addr) = ep_addr {
-            match (ep_addr.index(), ep_type) {
-                (0, EndpointType::Control) => {}
-                (8, EndpointType::Isochronous) => {}
-                (n, EndpointType::Bulk) | (n, EndpointType::Interrupt) if n >= 1 && n <= 7 => {}
-                _ => return Err(driver::EndpointAllocError),
-            }
-
-            ep_addr.index()
-        } else {
-            match ep_type {
-                EndpointType::Isochronous => 8,
-                EndpointType::Control => 0,
-                EndpointType::Interrupt | EndpointType::Bulk => {
-                    // Find rightmost zero bit in 1..=7
-                    let ones = (self.used >> 1).trailing_ones() as usize;
-                    if ones >= 7 {
-                        return Err(driver::EndpointAllocError);
-                    }
-                    ones + 1
-                }
-            }
-        };
-
-        if self.used & (1 << alloc_index) != 0 {
-            return Err(driver::EndpointAllocError);
-        }
-
-        self.used |= 1 << alloc_index;
-        self.lens[alloc_index] = max_packet_size as u8;
-
-        Ok(alloc_index)
-    }
 }
 
 pub(crate) mod sealed {
